@@ -1,10 +1,15 @@
 # %%
-from cgitb import grey
+import pandas
+from contextlib import contextmanager
 import copy
 import random
 from dataclasses import dataclass, field
 from enum import Enum
 from multiprocessing.sharedctypes import Value
+import shelve
+from typing import Mapping, MutableMapping, Optional
+
+import ray
 
 from tqdm import tqdm
 from absl import app, flags
@@ -15,7 +20,7 @@ FLAGS = flags.FLAGS
 
 WORD_LEN = 5
 
-
+# %% 
 class Matching(Enum):
     EXACT = "+"
     SEMI = "?"
@@ -28,7 +33,7 @@ class Status(Enum):
     LOSE = "LOSE"
 
 
-def render_ascii(matchings: list[Matching]) -> str:
+def render_ascii(matchings: tuple[Matching]) -> str:
     return "".join(matching.value if matching else " " for matching in matchings)
 
 
@@ -45,10 +50,10 @@ class Wordle:
 
     attemps_left: int = 0
     status: Status = Status.IN_PROGRESS
-    history: list[tuple[str, list[Matching]]] = field(default_factory=list)
-    answer: str | None = None
+    history: list[tuple[str, tuple[Matching]]] = field(default_factory=list)
+    answer: Optional[str] = None
 
-    def reset(self, answer: str | None = None) -> "Wordle":
+    def reset(self, answer: Optional[str] = None) -> "Wordle":
         if answer:
             self.answer = answer
         else:
@@ -85,8 +90,8 @@ class Wordle:
         return word in self.allowed_words or word in self.answer_words
 
     @staticmethod
-    def match_words(answer, guess) -> list[Matching]:
-        result: list[Matching | None] = [None] * WORD_LEN
+    def match_words(answer, guess) -> tuple[Matching, ...]:
+        result: list[Optional[Matching]] = [None] * WORD_LEN
         used = set()
 
         for i, guess_char in enumerate(guess):
@@ -102,7 +107,17 @@ class Wordle:
                         used.add(j)
                         break
 
-        return [r if r else Matching.NONE for r in result]
+        return tuple(r if r else Matching.NONE for r in result)
+
+    @staticmethod
+    def match_words_with_cache(cache, answer, guess) -> tuple[Matching, ...]:
+        key = f"{answer}/{guess}"
+        if key in cache:
+            return cache[key]
+        else:
+            result = Wordle.match_words(answer, guess)
+            cache[key] = result
+            return result
 
     def get_candidates(self):
         for answer in self.answer_words:
@@ -117,7 +132,7 @@ class Wordle:
 
     def fork(self):
         w = Wordle(allowed_words=self.allowed_words, answer_words=self.answer_words)
-        w.reset(self.answer)
+        w.answer = self.answer
         w.history = copy.deepcopy(self.history)
         w.status = self.status
         w.attemps_left = self.attemps_left
@@ -172,46 +187,83 @@ class RandomPolicy(Policy):
         return random.choice(list(wordle.get_candidates()))
 
 
+@ray.remote
+def score_guess(wordle: Wordle, guess: str):
+    before = len(list(wordle.get_candidates()))
+    fork = wordle.fork()
+    fork.submit_guess(guess)
+    after = len(list(fork.get_candidates()))
+    score = after - before
+    return guess, score
+
+
+@dataclass
 class GreedyEliminationPolicy(Policy):
+    cache: dict = field(default_factory=dict)
+
+    def reset(self):
+        self.cache = {}
+
     def guess(self, wordle: Wordle) -> str:
-        candidates = list(wordle.get_candidates())
-        scores = []
-        curr_best = 0
-        for candidate in candidates:
-            fork = wordle.fork()
-            fork.submit_guess(candidate)
-            score = len(candidates) - len(list(fork.get_candidates()))
-            scores.append(score)
-            curr_best = max(curr_best, score)
-        return candidates[scores.index(curr_best)]
+        history = tuple(wordle.history)
+        if history in self.cache:
+            return self.cache[history]
+        else:
+            candidates = list(wordle.get_candidates())
+            scores = []
+            curr_best = 0
+            for candidate in candidates:
+                fork = wordle.fork()
+                fork.submit_guess(candidate)
+                score = len(candidates) - len(list(fork.get_candidates()))
+                scores.append(score)
+                curr_best = max(curr_best, score)
+            to_guess = candidates[scores.index(curr_best)]
+            self.cache[history] = to_guess
+            return to_guess
 
 
-def benchmark_policy(wordle, policy):
-    wordle = Wordle()
+def benchmark_policy(wordle, policy, log_fname="eval.log"):
+    wordle = Wordle(max_attemps=20)
     stats = {
         "num_wins": 0,
         "num_loses": 0,
         "num_guesses": 0,
-        "num_games": len(wordle.answer_words),
+        "num_games": 0,
     }
     progress_bar = tqdm(wordle.answer_words)
-    for answer in progress_bar:
-        wordle.reset(answer)
-        while wordle.status == Status.IN_PROGRESS:
-            guess = policy.guess(wordle)
-            wordle.submit_guess(guess)
-        if wordle.status == Status.WIN:
-            stats["num_wins"] += 1
-            stats["num_guesses"] += wordle.attemps
-        elif wordle.status == Status.LOSE:
-            stats["num_loses"] += 1
-            stats["num_guesses"] += wordle.attemps
+    progress_bar_postfix_width = None
 
-        stats["average_guesses"] = round(stats["num_guesses"] / stats["num_games"], 3)
-        stats["win_rate"] = round(
-            stats["num_wins"] / (stats["num_wins"] + stats["num_loses"]), 3
-        )
-        progress_bar.set_description(str(stats))
+    with open(log_fname, "w") as f:
+        for answer in progress_bar:
+            wordle.reset(answer)
+            while wordle.status == Status.IN_PROGRESS:
+                guess = policy.guess(wordle)
+                wordle.submit_guess(guess)
+            if wordle.status == Status.WIN:
+                stats["num_wins"] += 1
+                stats["num_guesses"] += wordle.attemps
+            elif wordle.status == Status.LOSE:
+                stats["num_loses"] += 1
+                stats["num_guesses"] += wordle.attemps
+            stats["num_games"] += 1
+
+            stats["average_guesses"] = round(
+                stats["num_guesses"] / stats["num_games"], 3
+            )
+            stats["win_rate"] = round(
+                stats["num_wins"] / (stats["num_wins"] + stats["num_loses"]), 3
+            )
+            if not progress_bar_postfix_width:
+                progress_bar_postfix_width = len(str(stats)) + 20
+            progress_bar.set_postfix_str(str(stats).ljust(progress_bar_postfix_width))
+
+            s = f"answer: {answer}\n"
+            for guess, matchings in wordle.history:
+                s += f"{guess}  {render_ascii(matchings)}\n"
+            s += "\n"
+            f.write(s)
+
     return stats
 
 
@@ -221,9 +273,14 @@ def main(*args):
     game = TerminalGame()
     game.start()
 
+# %% 
+w = Wordle()
+word_pool = random.sample(list(w.answer_words), k=1000)
+print(len(word_pool))
 
 # %%
-benchmark_policy(Wordle(), GreedyEliminationPolicy())
-# %%
-
+%%time
+with shelve.open('matching_cache.shelf') as db:
+    for word in word_pool:
+        Wordle.match_words_with_cache(db, word, word)
 # %%
